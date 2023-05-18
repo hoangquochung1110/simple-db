@@ -1,0 +1,2 @@
+### Part 6:
+We provide **Cursor** abstraction layer which help `execute_select` and `execute_insert` can interact with the table entirely through the cursor without assuming anything about how the table is stored.
