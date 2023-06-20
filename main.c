@@ -63,13 +63,77 @@ const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 typedef struct {
     int file_descriptor;
     uint32_t file_length;
+    // The number of pages should be associated to Pager, not Table
+    // since it's the # of pages used by the db, not a particular table
+    uint32_t num_pages;
     void* pages[TABLE_MAX_PAGES];
 } Pager;
 
 typedef struct {
     Pager* pager;
-    uint32_t num_rows;
+    // Root page number help us identify a btree
+    uint32_t root_page_num;
 } Table;
+
+/*
+Leaf nodes and internal nodes have different layouts.
+Let's make an enum to keep track of node type.
+*/  
+typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
+
+/*
+* Common Node Header Layout
+* store metadata in a header at the beginning of the page. 
+*/
+const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t NODE_TYPE_OFFSET = 0;
+const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t IS_ROOT_OFFSET = NODE_TYPE_SIZE + NODE_TYPE_OFFSET;
+const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
+const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_SIZE + IS_ROOT_OFFSET;
+const uint8_t COMMON_NODE_HEADER_SIZE =
+    NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+/*
+* Leaf Node Format
+* Additionally, leaf nodes need to store how many "cells" they contain
+* A cell is a key/value pair.
+*/
+const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE =
+    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+/*
+* Leaf Node Body Layout
+* It's an array of cells
+*/
+const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_KEY_OFFSET = 0;
+const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const uint32_t LEAF_NODE_VALUE_OFFSET =
+    LEAF_NODE_KEY_SIZE + LEAF_NODE_KEY_OFFSET;
+const uint32_t LEAF_NODE_CELL_SIZE =
+    LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_MAX_CELLS =
+    LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+uint32_t* leaf_node_num_cells(void* node) {
+    return node + LEAF_NODE_NUM_CELLS_OFFSET;
+}
+
+void* leaf_node_cell(void* node, uint32_t cell_num) {
+    return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+}
+
+void* leaf_node_value(void* node, uint32_t cell_num) {
+    return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+}
+
+void initialize_leaf_node(void* node) { 
+    *leaf_node_num_cells(node) = 0;
+}
 
 typedef struct {
     /*
@@ -127,6 +191,10 @@ void* get_page(Pager* pager, uint32_t page_num) {
             }
         }
         pager->pages[page_num] = page;
+
+        if (page_num >= pager->num_pages) {
+            pager->num_pages = page_num + 1;
+        }
     }
 
     return pager->pages[page_num];
@@ -193,7 +261,7 @@ Pager* pager_open(const char* filename) {
     return pager;
 }
 
-void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+void pager_flush(Pager* pager, uint32_t page_num) {
     if (pager->pages[page_num] == NULL) {
         printf("Tried to flush null page\n");
         exit(EXIT_FAILURE);
@@ -206,7 +274,7 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
         exit(EXIT_FAILURE);
     }
 
-    ssize_t bytes_written = write(pager->file_descriptor, pager->pages[page_num], size);
+    ssize_t bytes_written = write(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE);
 
     if (bytes_written == -1) {
         printf("Error writing: %d\n", errno);
@@ -226,27 +294,14 @@ Table* db_open(const char* filename) {
 
 void db_close(Table* table) {
     Pager* pager = table->pager;
-    uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
 
-    for (uint32_t i = 0; i < num_full_pages; i++) {
+    for (uint32_t i = 0; i < pager->num_pages; i++) {
         if (pager->pages[i] == NULL) {
             continue;
         }
-        pager_flush(pager, i, PAGE_SIZE);
+        pager_flush(pager, i);
         free(pager->pages[i]);
         pager->pages[i] = NULL;
-    }
-
-    // There may be a partial page to write to the end of the file
-    // This should not be needed after we switch to a B-tree
-    uint32_t num_additional_rows = table->num_rows % ROWS_PER_PAGE;
-    if (num_additional_rows > 0) {
-        uint32_t page_num = num_full_pages;
-        if (pager->pages[page_num] != NULL) {
-            pager_flush(pager, page_num, num_additional_rows * ROW_SIZE);
-            free(pager->pages[page_num]);
-            pager->pages[page_num] = NULL;
-        }
     }
 
     int result = close(pager->file_descriptor);
